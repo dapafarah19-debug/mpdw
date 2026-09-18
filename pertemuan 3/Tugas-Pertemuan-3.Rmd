@@ -1,0 +1,402 @@
+---
+title: "Tugas Individu Pertemuan 3"
+subtitle: "Regresi dengan Peubah Lag: Koyck, Distributed Lag Model (DLM), dan ARDL"
+author: "M. Dava Arya Permadi — NIM 1004261009"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+library(dynlm)
+library(lmtest)
+library(ggplot2)
+
+options(scipen = 100, digits = 5)
+```
+
+# Pendahuluan
+
+Tugas ini menerapkan tiga pendekatan regresi dengan peubah lag (**Koyck**,
+**Distributed Lag Model / DLM**, dan **Autoregressive Distributed Lag / ARDL**)
+pada data kualitas udara Kota New Delhi (`NewDelhi_Air_quality.csv`). Variabel
+dependen (**Y**) adalah **AQI (Air Quality Index)**, sedangkan variabel
+independen (**X**) yang dipilih adalah **CO (Carbon Monoxide)**.
+
+## Alasan pemilihan variabel X
+
+```{r data-load}
+df <- read.csv("NewDelhi_Air_quality.csv")
+df$datetime <- as.POSIXct(df$timestamp_local, format = "%Y-%m-%dT%H:%M:%S")
+df <- df[order(df$datetime), ]
+rownames(df) <- NULL
+str(df[, c("AQI","CO","no2","o3","pm10","pm25","so2","datetime")])
+```
+
+```{r correlation}
+cor_mat <- cor(df[, c("AQI","CO","no2","o3","pm10","pm25","so2")])
+round(cor_mat, 3)
+```
+
+Korelasi terhadap AQI: **O3 (0.974)** dan **CO (0.798)** adalah yang tertinggi.
+O3 tidak dipilih karena korelasinya yang mendekati sempurna mengindikasikan O3
+kemungkinan besar menjadi komponen dominan pembentuk nilai AQI itu sendiri
+pada periode data ini (hubungan hampir identik/tautologis), sehingga kurang
+tepat dijadikan **X** yang independen secara konseptual. **CO** dipilih sebagai
+variabel independen (X) karena memiliki korelasi kuat dan searah dengan AQI
+(0.798), namun tetap merepresentasikan polutan yang berdiri sendiri secara
+fisik (emisi pembakaran kendaraan/industri) — sehingga hubungan lag antara CO
+dan AQI lebih bermakna untuk dimodelkan.
+
+```{r ts-plot, fig.width=9, fig.height=4}
+ggplot(df, aes(x = datetime)) +
+  geom_line(aes(y = AQI, color = "AQI")) +
+  geom_line(aes(y = CO/8, color = "CO (skala/8)")) +
+  scale_color_manual(values = c("AQI" = "#dc2626", "CO (skala/8)" = "#2563eb")) +
+  labs(title = "Perkembangan AQI dan CO — New Delhi (21-24 Okt 2022)",
+       x = "Waktu", y = "Nilai", color = "Variabel") +
+  theme_minimal()
+```
+
+## Pembagian Data (Train / Test)
+
+Data time series berjumlah **`r nrow(df)`** observasi (data per jam). Untuk
+mengevaluasi kinerja peramalan, data dibagi menjadi **data latih (train)** dan
+**data uji (test)** — 12 observasi terakhir digunakan sebagai data uji.
+
+```{r split}
+n <- nrow(df)
+n_test <- 12
+n_train <- n - n_test
+
+train <- df[1:n_train, ]
+test  <- df[(n_train + 1):n, ]
+
+cat("Jumlah data latih :", nrow(train), "\n")
+cat("Jumlah data uji    :", nrow(test), "\n")
+```
+
+```{r helper-functions}
+mape <- function(actual, pred) mean(abs((actual - pred) / actual)) * 100
+
+lagvec <- function(x, k) {
+  n <- length(x)
+  if (k == 0) return(x)
+  c(rep(NA, k), x[1:(n - k)])
+}
+```
+
+---
+
+# Model 1 — Koyck
+
+Model Koyck berangkat dari model distributed lag **tak hingga** dengan bobot
+koefisien yang menurun secara geometris ($\beta_i = \beta_0 \lambda^i$).
+Melalui transformasi Koyck, model tak hingga tersebut disederhanakan menjadi
+model dengan **satu lag Y** dan **X pada waktu berjalan**:
+
+$$AQI_t = \alpha + \lambda \cdot AQI_{t-1} + \beta_0 \cdot CO_t + e_t$$
+
+## Menentukan lag optimum
+
+Berbeda dengan DLM/ARDL, struktur Koyck **sudah baku secara matematis**: transformasi
+Koyck justru dibuat khusus untuk memampatkan lag X yang tak hingga menjadi
+**tepat satu lag** pada Y. Sehingga "lag optimum" untuk model Koyck **selalu
+order (1,0)** — satu lag Y, nol lag X — dan tidak memerlukan proses pencarian
+lag seperti DLM/ARDL. Parameter $\lambda$ (koefisien lag Y) itulah yang
+merepresentasikan kecepatan peluruhan pengaruh CO terhadap AQI dari waktu ke waktu.
+
+```{r koyck-fit}
+train$AQI_lag1 <- lagvec(train$AQI, 1)
+
+koyck_model <- lm(AQI ~ AQI_lag1 + CO, data = train)
+summary(koyck_model)
+```
+
+```{r koyck-interpret}
+lambda_hat <- coef(koyck_model)["AQI_lag1"]
+beta0_hat  <- coef(koyck_model)["CO"]
+long_run   <- beta0_hat / (1 - lambda_hat)
+
+cat("Lambda (kecepatan peluruhan)  :", round(lambda_hat, 4), "\n")
+cat("Beta0  (efek jangka pendek CO):", round(beta0_hat, 4), "\n")
+cat("Efek jangka panjang CO -> AQI :", round(long_run, 4), "\n")
+```
+
+Nilai $\lambda$ = `r round(lambda_hat,4)` menunjukkan seberapa besar pengaruh
+AQI periode sebelumnya masih terbawa ke periode sekarang; sisanya
+($\beta_0$ = `r round(beta0_hat,4)`) adalah efek langsung CO pada AQI saat ini.
+
+---
+
+# Model 2 — Distributed Lag Model (DLM)
+
+Model DLM murni memasukkan **X pada berbagai lag** tanpa lag pada Y:
+
+$$AQI_t = \alpha + \beta_0 CO_t + \beta_1 CO_{t-1} + \dots + \beta_q CO_{t-q} + e_t$$
+
+## Menentukan lag optimum (q)
+
+Lag optimum dicari dengan membandingkan **AIC** dari model DLM untuk
+$q = 0, 1, \dots, 8$, lalu memilih $q$ dengan AIC terkecil.
+
+```{r dlm-search}
+max_lag_dlm <- 8
+aic_dlm <- numeric(max_lag_dlm + 1)
+
+for (q in 0:max_lag_dlm) {
+  dtemp <- train
+  for (k in 0:q) dtemp[[paste0("CO_l", k)]] <- lagvec(dtemp$CO, k)
+  form <- as.formula(paste("AQI ~", paste(paste0("CO_l", 0:q), collapse = " + ")))
+  fit <- lm(form, data = dtemp)
+  aic_dlm[q + 1] <- AIC(fit)
+}
+
+dlm_aic_table <- data.frame(Lag_q = 0:max_lag_dlm, AIC = round(aic_dlm, 2))
+dlm_aic_table
+```
+
+```{r dlm-plot, fig.width=6, fig.height=3.5}
+ggplot(dlm_aic_table, aes(x = Lag_q, y = AIC)) +
+  geom_line(color = "#4338ca") + geom_point(color = "#4338ca", size = 2) +
+  labs(title = "Pemilihan Lag Optimum — DLM (berdasarkan AIC)", x = "Lag q", y = "AIC") +
+  theme_minimal()
+```
+
+```{r dlm-best}
+q_opt <- dlm_aic_table$Lag_q[which.min(dlm_aic_table$AIC)]
+cat("Lag optimum DLM (q) =", q_opt, "\n")
+
+for (k in 0:q_opt) train[[paste0("CO_l", k)]] <- lagvec(train$CO, k)
+form_dlm <- as.formula(paste("AQI ~", paste(paste0("CO_l", 0:q_opt), collapse = " + ")))
+dlm_model <- lm(form_dlm, data = train)
+summary(dlm_model)
+```
+
+Lag optimum DLM terpilih adalah **q = `r q_opt`**, artinya pengaruh CO
+terhadap AQI signifikan tercermin hingga `r q_opt` jam sebelumnya.
+
+---
+
+# Model 3 — Autoregressive Distributed Lag (ARDL)
+
+Model ARDL(p,q) menggabungkan lag Y (autoregresif) **dan** lag X sekaligus:
+
+$$AQI_t = \alpha + \sum_{i=1}^{p}\phi_i AQI_{t-i} + \sum_{j=0}^{q}\beta_j CO_{t-j} + e_t$$
+
+## Menentukan lag optimum (p, q)
+
+Lag optimum $(p,q)$ dicari melalui **grid search** $p = 1,\dots,4$ dan
+$q = 0,\dots,4$, memilih kombinasi dengan AIC terkecil.
+
+```{r ardl-search}
+max_p <- 4; max_q <- 4
+grid <- expand.grid(p = 1:max_p, q = 0:max_q)
+grid$AIC <- NA
+
+for (i in seq_len(nrow(grid))) {
+  p <- grid$p[i]; q <- grid$q[i]
+  dtemp <- train
+  for (k in 1:p) dtemp[[paste0("AQI_l", k)]] <- lagvec(dtemp$AQI, k)
+  for (k in 0:q) dtemp[[paste0("CO_l", k)]]  <- lagvec(dtemp$CO, k)
+  rhs <- paste(c(paste0("AQI_l", 1:p), paste0("CO_l", 0:q)), collapse = " + ")
+  fit <- tryCatch(lm(as.formula(paste("AQI ~", rhs)), data = dtemp), error = function(e) NULL)
+  if (!is.null(fit)) grid$AIC[i] <- AIC(fit)
+}
+
+grid_ordered <- grid[order(grid$AIC), ]
+head(grid_ordered, 10)
+```
+
+```{r ardl-heatmap, fig.width=6.5, fig.height=4.5}
+ggplot(grid, aes(x = factor(q), y = factor(p), fill = AIC)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "#4338ca", high = "#f3f4f6") +
+  labs(title = "Grid Search AIC — ARDL(p,q)", x = "Lag q (X)", y = "Lag p (Y)") +
+  theme_minimal()
+```
+
+```{r ardl-best}
+best <- grid_ordered[1, ]
+p_opt <- best$p; q_opt_ardl <- best$q
+cat("Lag optimum ARDL: p =", p_opt, ", q =", q_opt_ardl, "\n")
+
+for (k in 1:p_opt) train[[paste0("AQI_l", k)]] <- lagvec(train$AQI, k)
+for (k in 0:q_opt_ardl) train[[paste0("CO_l", k)]] <- lagvec(train$CO, k)
+rhs_best <- paste(c(paste0("AQI_l", 1:p_opt), paste0("CO_l", 0:q_opt_ardl)), collapse = " + ")
+ardl_model <- lm(as.formula(paste("AQI ~", rhs_best)), data = train)
+summary(ardl_model)
+```
+
+Kombinasi lag optimum ARDL adalah **p = `r p_opt`** (lag AQI) dan
+**q = `r q_opt_ardl`** (lag CO), berdasarkan AIC terkecil = `r round(best$AIC,2)`.
+
+---
+
+# Uji Asumsi Model
+
+Tiga asumsi utama diuji untuk residual masing-masing model: **normalitas**
+(Shapiro-Wilk), **autokorelasi** (Breusch-Godfrey), dan **heteroskedastisitas**
+(Breusch-Pagan).
+
+```{r assumption-tests}
+uji_asumsi <- function(model, nama) {
+  sw  <- shapiro.test(residuals(model))
+  bg  <- tryCatch(bgtest(model), error = function(e) list(p.value = NA))
+  bp  <- tryCatch(bptest(model), error = function(e) list(p.value = NA))
+  data.frame(
+    Model = nama,
+    Shapiro_p = round(sw$p.value, 4),
+    Normalitas = ifelse(sw$p.value > 0.05, "Normal", "Tidak Normal"),
+    BG_p = round(bg$p.value, 4),
+    Autokorelasi = ifelse(is.na(bg$p.value), NA, ifelse(bg$p.value > 0.05, "Tidak Ada", "Ada")),
+    BP_p = round(bp$p.value, 4),
+    Heteroskedastisitas = ifelse(is.na(bp$p.value), NA, ifelse(bp$p.value > 0.05, "Homoskedastik", "Heteroskedastik"))
+  )
+}
+
+tabel_asumsi <- rbind(
+  uji_asumsi(koyck_model, "Koyck"),
+  uji_asumsi(dlm_model, "DLM"),
+  uji_asumsi(ardl_model, "ARDL")
+)
+tabel_asumsi
+```
+
+**Interpretasi ringkas:** nilai p-value > 0.05 pada uji Shapiro-Wilk
+menunjukkan residual berdistribusi normal; p-value > 0.05 pada uji
+Breusch-Godfrey menunjukkan tidak ada autokorelasi; dan p-value > 0.05 pada
+uji Breusch-Pagan menunjukkan varian residual homoskedastik (konstan).
+Jika salah satu asumsi dilanggar, model tetap dapat digunakan untuk
+peramalan namun interpretasi inferensia (uji-t, uji-F) perlu dilakukan
+dengan hati-hati (misalnya menggunakan galat baku robust HAC).
+
+---
+
+# Evaluasi & Perbandingan Kinerja Peramalan
+
+Peramalan dilakukan secara **rekursif (dynamic forecast)** pada data uji
+(12 jam terakhir): nilai AQI hasil ramalan periode sebelumnya digunakan
+sebagai input lag Y untuk periode berikutnya (bukan nilai aktual), agar
+mencerminkan situasi peramalan riil ke depan.
+
+```{r forecast-setup}
+full <- df
+full$AQI_l1 <- lagvec(full$AQI, 1)
+for (k in 1:max(p_opt, 1)) full[[paste0("AQI_l", k)]] <- lagvec(full$AQI, k)
+for (k in 0:max(q_opt, q_opt_ardl)) full[[paste0("CO_l", k)]] <- lagvec(full$CO, k)
+
+idx_test <- (n_train + 1):n
+actual_test <- df$AQI[idx_test]
+```
+
+```{r forecast-koyck}
+y_hist <- df$AQI[1:n_train]
+pred_koyck <- numeric(n_test)
+y_prev <- y_hist[n_train]
+for (i in seq_len(n_test)) {
+  x_now <- df$CO[n_train + i]
+  y_prev <- as.numeric(coef(koyck_model)["(Intercept)"] +
+                        coef(koyck_model)["AQI_lag1"] * y_prev +
+                        coef(koyck_model)["CO"] * x_now)
+  pred_koyck[i] <- y_prev
+}
+```
+
+```{r forecast-dlm}
+co_hist <- df$CO
+pred_dlm <- numeric(n_test)
+for (i in seq_len(n_test)) {
+  t_idx <- n_train + i
+  xrow <- sapply(0:q_opt, function(k) co_hist[t_idx - k])
+  names(xrow) <- paste0("CO_l", 0:q_opt)
+  pred_dlm[i] <- as.numeric(coef(dlm_model)["(Intercept)"] + sum(coef(dlm_model)[paste0("CO_l", 0:q_opt)] * xrow))
+}
+```
+
+```{r forecast-ardl}
+y_buffer <- df$AQI[1:n_train]
+pred_ardl <- numeric(n_test)
+for (i in seq_len(n_test)) {
+  t_idx <- n_train + i
+  y_lags <- sapply(1:p_opt, function(k) if (i - k > 0) pred_ardl[i - k] else y_buffer[n_train + i - k])
+  x_lags <- sapply(0:q_opt_ardl, function(k) co_hist[t_idx - k])
+  names(y_lags) <- paste0("AQI_l", 1:p_opt)
+  names(x_lags) <- paste0("CO_l", 0:q_opt_ardl)
+  pred_ardl[i] <- as.numeric(coef(ardl_model)["(Intercept)"] +
+                              sum(coef(ardl_model)[paste0("AQI_l", 1:p_opt)] * y_lags) +
+                              sum(coef(ardl_model)[paste0("CO_l", 0:q_opt_ardl)] * x_lags))
+}
+```
+
+```{r evaluation-table}
+mape_koyck <- mape(actual_test, pred_koyck)
+mape_dlm   <- mape(actual_test, pred_dlm)
+mape_ardl  <- mape(actual_test, pred_ardl)
+
+hasil_eval <- data.frame(
+  Model = c("Koyck", "DLM", "ARDL"),
+  Lag_Optimum = c("p=1, q=0 (baku)", paste0("q=", q_opt), paste0("p=", p_opt, ", q=", q_opt_ardl)),
+  Deviance_Train = round(c(deviance(koyck_model), deviance(dlm_model), deviance(ardl_model)), 3),
+  AIC_Train = round(c(AIC(koyck_model), AIC(dlm_model), AIC(ardl_model)), 2),
+  MAPE_Test = round(c(mape_koyck, mape_dlm, mape_ardl), 3)
+)
+hasil_eval
+```
+
+```{r evaluation-plot, fig.width=9, fig.height=4.5}
+plot_df <- data.frame(
+  datetime = rep(df$datetime[idx_test], 4),
+  AQI = c(actual_test, pred_koyck, pred_dlm, pred_ardl),
+  Seri = rep(c("Aktual", "Koyck", "DLM", "ARDL"), each = n_test)
+)
+
+ggplot(plot_df, aes(x = datetime, y = AQI, color = Seri, linetype = Seri)) +
+  geom_line(linewidth = 1) + geom_point(size = 1.6) +
+  scale_color_manual(values = c("Aktual" = "black", "Koyck" = "#dc2626", "DLM" = "#059669", "ARDL" = "#4338ca")) +
+  labs(title = "Perbandingan Aktual vs Ramalan AQI — Data Uji (12 jam terakhir)",
+       x = "Waktu", y = "AQI") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+Berdasarkan **MAPE** pada data uji, model dengan nilai MAPE terkecil dianggap
+memiliki kinerja peramalan terbaik. Berdasarkan **deviance/AIC** pada data
+latih, model dengan nilai terkecil dianggap paling baik kesesuaiannya (goodness
+of fit) terhadap data historis.
+
+```{r best-model}
+best_model_name <- hasil_eval$Model[which.min(hasil_eval$MAPE_Test)]
+cat("Model dengan MAPE (data uji) terkecil:", best_model_name, "\n")
+```
+
+---
+
+# Kesimpulan
+
+1. Variabel independen (X) yang digunakan adalah **CO**, dipilih karena
+   memiliki korelasi kuat (0.798) dan bermakna secara fisik terhadap AQI,
+   tanpa risiko tautologi seperti O3.
+2. Lag optimum masing-masing metode:
+   - **Koyck**: order tetap (1,0) — bawaan dari transformasi geometrik.
+   - **DLM**: q = `r q_opt` (dipilih berdasarkan AIC minimum).
+   - **ARDL**: p = `r p_opt`, q = `r q_opt_ardl` (dipilih berdasarkan AIC
+     minimum hasil grid search).
+3. Uji asumsi menunjukkan kondisi normalitas, autokorelasi, dan
+   heteroskedastisitas sebagaimana dirangkum pada tabel di atas — perlu
+   diperhatikan pada tahap interpretasi koefisien.
+4. Berdasarkan metrik **MAPE** pada data uji, model **`r best_model_name`**
+   memberikan hasil peramalan yang paling akurat pada horizon 12 jam ke
+   depan untuk kasus data ini.
+
+*Catatan: karena rentang data yang tersedia relatif pendek (`r nrow(df)`
+observasi / ± 3 hari), hasil pemilihan lag dan performa model dapat berubah
+apabila diterapkan pada rentang data yang lebih panjang.*

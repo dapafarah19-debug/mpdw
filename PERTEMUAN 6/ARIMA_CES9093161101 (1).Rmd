@@ -1,0 +1,401 @@
+---
+title: "Pemodelan ARIMA - Data CES9093161101"
+subtitle: "Praktikum MPDW: Identifikasi, Pendugaan Parameter, Diagnostik Model, dan Peramalan"
+author: "ISI NAMA / NIM"
+date: "1 Oktober 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: paged
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 4.5)
+```
+
+# Packages
+
+```{r packages}
+library(readxl)
+library(ggplot2)
+library(tseries)   # adf.test
+library(MASS)      # boxcox
+library(forecast)  # Arima, forecast, accuracy
+library(lmtest)    # coeftest
+# TSA dipanggil dengan TSA::eacf() agar tidak menimpa fungsi acf/arima
+```
+
+# Data
+
+Data yang digunakan adalah data **CES9093161101** (data bulanan) yang dikumpulkan pada awal praktikum.
+**Ganti nilai `file_data` sesuai nama file di repositori.** Kolom yang dibaca: kolom 1 = tanggal, kolom 3 = nilai
+(format yang sama dengan file dari FRED).
+
+```{r data}
+file_data <- "CES9093161101_Period343-512_Bersih.xlsx"   # <- ganti jika perlu
+
+dat <- if (grepl("\\.csv$", file_data)) read.csv(file_data) else read_excel(file_data)
+tgl <- as.Date(dat[[1]])
+y   <- as.numeric(dat[[ncol(dat)]])
+n   <- length(y)
+cat("Jumlah amatan:", n, "\nPeriode:", format(min(tgl)), "s.d.", format(max(tgl)), "\n")
+if (n < 500) warning("Jumlah amatan < 500, minimal tugas adalah 500 amatan!")
+head(data.frame(tgl, y))
+```
+
+Jumlah amatan yang digunakan adalah **`r n`** amatan (syarat tugas minimal 500).
+
+# Tahap 1: Pembagian Data Latih dan Data Uji
+
+Pembagian data dilakukan menyesuaikan pola data: data uji diambil sebagai **24 amatan terakhir (2 tahun)**
+supaya peramalan dievaluasi pada horizon yang masuk akal untuk data bulanan. Ubah `n_test` jika ingin proporsi lain.
+
+```{r split}
+n_test  <- 24
+n_train <- n - n_test
+
+train <- y[1:n_train];        tgl.train <- tgl[1:n_train]
+test  <- y[(n_train+1):n];    tgl.test  <- tgl[(n_train+1):n]
+train.ts <- ts(train); test.ts <- ts(test, start = n_train + 1)
+
+cat("Data latih :", n_train, "amatan (", round(100*n_train/n, 1), "% )\n")
+cat("Data uji   :", n_test,  "amatan (", round(100*n_test/n, 1),  "% )\n")
+```
+
+```{r plot-split}
+df.plot <- data.frame(tgl = tgl, y = y,
+                      set = rep(c("Latih", "Uji"), c(n_train, n_test)))
+ggplot(df.plot, aes(tgl, y, color = set)) + geom_line(linewidth = 0.8) +
+  scale_color_manual(values = c("navyblue", "red")) +
+  labs(title = "Plot Data CES9093161101: Data Latih dan Data Uji",
+       x = "Waktu", y = "Nilai", color = "") + theme_minimal()
+```
+
+Berdasarkan plot, data memiliki pola **trend naik** dari awal hingga akhir periode, sehingga data diduga tidak stasioner
+dalam rataan.
+
+# Tahap 2: Uji Stasioneritas Data Latih
+
+## Stasioneritas dalam Rataan
+
+### Plot Data Latih dan ACF
+
+```{r acf-train}
+plot.ts(train.ts, xlab = "Waktu", ylab = "Nilai", main = "Plot Data Latih", col = "navyblue")
+acf(train.ts, lag.max = 36, main = "ACF Data Latih")
+```
+
+Plot ACF menurun secara perlahan (*tails off slowly*) yang mengindikasikan data tidak stasioner dalam rataan.
+
+### Uji ADF
+
+$H_0$ : data tidak stasioner dalam rataan; $H_1$ : data stasioner dalam rataan
+
+```{r adf-train}
+adf.train <- tseries::adf.test(train.ts)
+adf.train
+```
+
+Diperoleh p-value sebesar **`r round(adf.train$p.value, 4)`**
+`r ifelse(adf.train$p.value < 0.05, "< 0,05 sehingga tolak $H_0$: data stasioner dalam rataan.", "> 0,05 sehingga tak tolak $H_0$: data tidak stasioner dalam rataan dan perlu dilakukan differencing.")`
+
+## Stasioneritas dalam Ragam (Box-Cox)
+
+```{r boxcox}
+index <- seq_along(train.ts)
+bc <- boxcox(train.ts ~ index, lambda = seq(-3, 4, by = 0.05))
+
+lambda_opt <- bc$x[which.max(bc$y)]
+ci_lambda  <- bc$x[bc$y > max(bc$y) - 0.5 * qchisq(0.95, df = 1)]
+ci_lower <- min(ci_lambda); ci_upper <- max(ci_lambda)
+c(Lambda_Optimum = lambda_opt, Batas_Bawah = ci_lower, Batas_Atas = ci_upper)
+
+ragam_stasioner <- (ci_lower <= 1 & ci_upper >= 1)
+```
+
+Nilai $\lambda$ optimum sebesar **`r round(lambda_opt, 2)`** dengan selang kepercayaan 95% **[`r round(ci_lower, 2)`; `r round(ci_upper, 2)`]**.
+`r ifelse(ragam_stasioner, "Selang tersebut memuat angka 1 sehingga data **stasioner dalam ragam** dan tidak perlu transformasi.", "Selang tersebut **tidak memuat angka 1** sehingga data **tidak stasioner dalam ragam** dan perlu ditransformasi (transformasi Box-Cox dengan $\\lambda$ optimum, dilakukan langsung pada fungsi Arima dengan argumen lambda di bawah).")`
+
+```{r lambda-use}
+# lam = NULL berarti tanpa transformasi; selain itu data ditransformasi Box-Cox
+lam <- if (ragam_stasioner) NULL else lambda_opt
+lam
+```
+
+# Tahap 3: Penanganan Ketidakstasioneran (Differencing)
+
+Differencing dilakukan berulang sampai uji ADF menyatakan data stasioner dalam rataan (maksimal 2 kali).
+
+```{r differencing}
+base.ts <- if (is.null(lam)) train.ts else BoxCox(train.ts, lam)
+d_use <- 0; z <- base.ts
+while (tseries::adf.test(z)$p.value >= 0.05 && d_use < 2) {
+  d_use <- d_use + 1
+  z <- diff(base.ts, differences = d_use)
+}
+train.diff <- z
+cat("Banyaknya differencing (d) =", d_use, "\n")
+```
+
+```{r plot-diff}
+plot.ts(train.diff, xlab = "Waktu", ylab = "Data hasil differencing",
+        main = paste("Plot Data Differencing ke-", d_use), col = "navyblue")
+abline(h = mean(train.diff), col = "red", lty = 2)
+acf(train.diff, lag.max = 36, main = "ACF Data Differencing")
+```
+
+```{r adf-diff}
+adf.diff <- tseries::adf.test(train.diff)
+adf.diff
+```
+
+Setelah differencing sebanyak **d = `r d_use`**, uji ADF memberikan p-value **`r round(adf.diff$p.value, 4)`**
+`r ifelse(adf.diff$p.value < 0.05, "< 0,05 sehingga tolak $H_0$: data sudah stasioner dalam rataan dan dapat dilanjutkan ke pemodelan.", "> 0,05 sehingga data belum stasioner; periksa kembali nilai d.")`
+
+# Tahap 4: Identifikasi Model Tentatif
+
+## Plot ACF dan PACF
+
+```{r acf-pacf}
+par(mfrow = c(1, 2))
+acf(train.diff,  lag.max = 24, main = "ACF")
+pacf(train.diff, lag.max = 24, main = "PACF")
+par(mfrow = c(1, 1))
+```
+
+**Interpretasi (ISI SETELAH MELIHAT PLOT):** amati pada lag ke berapa ACF *cuts off* (menentukan orde MA, q) dan
+PACF *cuts off* (menentukan orde AR, p). Jika keduanya *tails off*, gunakan model campuran ARMA.
+
+## EACF
+
+```{r eacf}
+TSA::eacf(train.diff, ar.max = 7, ma.max = 7)
+```
+
+**Interpretasi (ISI SETELAH MELIHAT EACF):** ambil ujung kiri-atas segitiga "o" sebagai kandidat (p, q).
+
+## Daftar Model Tentatif
+
+Kandidat di bawah ini diisi (p, q) dari hasil ACF, PACF, dan EACF di atas. **Sesuaikan** daftar ini dengan hasil
+identifikasi kamu.
+
+```{r kandidat}
+kandidat <- list(c(0,1), c(1,0), c(1,1), c(0,2), c(2,0), c(2,1), c(1,2))
+nama_model <- function(p, q) paste0("ARIMA(", p, ",", d_use, ",", q, ")")
+sapply(kandidat, function(k) nama_model(k[1], k[2]))
+```
+
+# Tahap 5: Pendugaan Parameter, Signifikansi, dan AIC
+
+Pendugaan parameter dengan metode *maximum likelihood*. Untuk $d = 1$ ditambahkan suku *drift* (rataan data
+hasil differencing). Uji signifikansi parameter menggunakan uji-z (`coeftest`) dengan
+$H_0$: parameter sama dengan 0.
+
+```{r fit-models}
+fit_arima <- function(p, q, series = train.ts) {
+  Arima(series, order = c(p, d_use, q), include.drift = (d_use == 1),
+        lambda = lam, method = "ML")
+}
+models <- lapply(kandidat, function(k) fit_arima(k[1], k[2]))
+
+for (i in seq_along(kandidat)) {
+  cat("\n=====", nama_model(kandidat[[i]][1], kandidat[[i]][2]), "=====\n")
+  print(lmtest::coeftest(models[[i]]))
+}
+```
+
+```{r aic-table}
+cek_sig <- function(m) {
+  ct <- tryCatch(lmtest::coeftest(m), error = function(e) NULL)
+  if (is.null(ct)) return(c(NA, NA))
+  pv <- ct[!rownames(ct) %in% c("drift", "intercept"), 4]   # parameter AR/MA saja
+  c(sum(pv < 0.05, na.rm = TRUE), length(pv))
+}
+tab <- do.call(rbind, lapply(seq_along(models), function(i) {
+  s <- cek_sig(models[[i]])
+  data.frame(Model = nama_model(kandidat[[i]][1], kandidat[[i]][2]),
+             AIC = AIC(models[[i]]), BIC = BIC(models[[i]]),
+             Signifikan = paste0(s[1], " dari ", s[2]),
+             Semua_signifikan = isTRUE(s[1] == s[2]))
+}))
+tab <- tab[order(tab$AIC), ]; rownames(tab) <- NULL
+tab
+
+pool <- if (any(tab$Semua_signifikan)) tab[tab$Semua_signifikan, ] else tab
+model_terbaik_nama <- pool$Model[which.min(pool$AIC)]
+idx_best <- which(sapply(kandidat, function(k) nama_model(k[1], k[2])) == model_terbaik_nama)
+best <- models[[idx_best]]
+pq_best <- kandidat[[idx_best]]
+```
+
+Dari model yang seluruh parameter AR/MA-nya signifikan, nilai AIC terkecil dimiliki oleh
+**`r model_terbaik_nama`** (AIC = `r round(AIC(best), 2)`), sehingga model ini dipilih untuk dianalisis sisaannya.
+
+```{r best-summary}
+summary(best)
+```
+
+# Tahap 6: Analisis Sisaan
+
+## Eksplorasi Sisaan
+
+```{r resid-plot}
+sisaan <- as.numeric(residuals(best))
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+qqnorm(sisaan, main = "Normal Q-Q Plot"); qqline(sisaan, col = "blue", lwd = 2)
+plot(sisaan, type = "p", main = "Sisaan vs Waktu", xlab = "Waktu", ylab = "Sisaan"); abline(h = 0, col = "red")
+acf(sisaan,  lag.max = 24, main = "ACF Sisaan")
+pacf(sisaan, lag.max = 24, main = "PACF Sisaan")
+par(mfrow = c(1, 1))
+```
+
+**Interpretasi (ISI SETELAH MELIHAT PLOT):** Q-Q plot untuk normalitas, plot sisaan vs waktu untuk kehomogenan ragam,
+ACF/PACF sisaan untuk kebebasan sisaan (tidak boleh ada lag yang keluar batas).
+
+## Uji Formal
+
+```{r resid-tests}
+fitdf <- pq_best[1] + pq_best[2]
+uji <- list(
+  ks   = ks.test(sisaan, "pnorm", mean(sisaan), sd(sisaan)),
+  shap = shapiro.test(sisaan),
+  lb   = Box.test(sisaan, lag = 10, type = "Ljung-Box", fitdf = fitdf),
+  lb2  = Box.test(sisaan^2, lag = 10, type = "Ljung-Box"),
+  t    = t.test(sisaan, mu = 0, conf.level = 0.95)
+)
+hasil.uji <- data.frame(
+  Asumsi = c("Normalitas (Kolmogorov-Smirnov)", "Normalitas (Shapiro-Wilk)",
+             "Kebebasan sisaan (Ljung-Box)", "Kehomogenan ragam (Ljung-Box sisaan kuadrat)",
+             "Nilai tengah sisaan = 0 (uji-t)"),
+  H0 = c("Sisaan menyebar normal", "Sisaan menyebar normal", "Sisaan saling bebas",
+         "Ragam sisaan homogen", "Nilai tengah sisaan = 0"),
+  p_value = c(uji$ks$p.value, uji$shap$p.value, uji$lb$p.value, uji$lb2$p.value, uji$t$p.value)
+)
+hasil.uji$Keputusan <- ifelse(hasil.uji$p_value < 0.05, "Tolak H0", "Gagal tolak H0")
+hasil.uji$p_value <- signif(hasil.uji$p_value, 4)
+hasil.uji
+```
+
+Kesimpulan pada taraf nyata 5%:
+
+- **Normalitas:** p-value KS = `r signif(uji$ks$p.value, 3)` dan Shapiro-Wilk = `r signif(uji$shap$p.value, 3)` →
+  sisaan `r ifelse(uji$ks$p.value >= 0.05, "menyebar normal.", "tidak menyebar normal.")`
+- **Kebebasan sisaan:** p-value Ljung-Box = `r signif(uji$lb$p.value, 3)` →
+  sisaan `r ifelse(uji$lb$p.value >= 0.05, "saling bebas (tidak ada autokorelasi).", "tidak saling bebas (masih ada autokorelasi).")`
+- **Kehomogenan ragam:** p-value = `r signif(uji$lb2$p.value, 3)` →
+  ragam sisaan `r ifelse(uji$lb2$p.value >= 0.05, "homogen.", "tidak homogen (ada indikasi heteroskedastisitas).")`
+- **Nilai tengah sisaan:** p-value uji-t = `r signif(uji$t$p.value, 3)` →
+  nilai tengah sisaan `r ifelse(uji$t$p.value >= 0.05, "sama dengan nol.", "tidak sama dengan nol.")`
+
+# Tahap 7: Overfitting
+
+Overfitting dilakukan dengan menaikkan orde AR dan MA masing-masing satu tingkat dari model terbaik,
+yaitu **`r nama_model(pq_best[1]+1, pq_best[2])`** dan **`r nama_model(pq_best[1], pq_best[2]+1)`**. Model hasil
+overfitting dianggap lebih baik hanya jika AIC lebih kecil **dan** parameter tambahannya signifikan.
+
+```{r overfit}
+over_list <- list(c(pq_best[1] + 1, pq_best[2]), c(pq_best[1], pq_best[2] + 1))
+over_models <- lapply(over_list, function(k) fit_arima(k[1], k[2]))
+
+for (i in seq_along(over_list)) {
+  cat("\n=====", nama_model(over_list[[i]][1], over_list[[i]][2]), "=====\n")
+  print(lmtest::coeftest(over_models[[i]]))
+}
+
+# parameter tambahan = AR/MA berorde tertinggi yang baru
+sig_param_baru <- function(m, nama_param) {
+  ct <- lmtest::coeftest(m)
+  isTRUE(ct[nama_param, 4] < 0.05)
+}
+over_tab <- data.frame(
+  Model = c(model_terbaik_nama, sapply(over_list, function(k) nama_model(k[1], k[2]))),
+  AIC = c(AIC(best), sapply(over_models, AIC)),
+  BIC = c(BIC(best), sapply(over_models, BIC)),
+  Parameter_tambahan_signifikan = c(NA,
+        sig_param_baru(over_models[[1]], paste0("ar", over_list[[1]][1])),
+        sig_param_baru(over_models[[2]], paste0("ma", over_list[[2]][2])))
+)
+over_tab
+
+lebih_baik <- which(over_tab$AIC[-1] < over_tab$AIC[1] & over_tab$Parameter_tambahan_signifikan[-1] %in% TRUE)
+if (length(lebih_baik) > 0) {
+  pilih <- lebih_baik[which.min(over_tab$AIC[-1][lebih_baik])]
+  final_model <- over_models[[pilih]]; final_nama <- over_tab$Model[pilih + 1]
+} else {
+  final_model <- best; final_nama <- model_terbaik_nama
+}
+final_pq <- as.numeric(arimaorder(final_model))[c(1, 3)]
+```
+
+Hasil overfitting: model terbaik akhir adalah **`r final_nama`**
+`r ifelse(final_nama == model_terbaik_nama, "(model hasil overfitting tidak lebih baik: AIC tidak lebih kecil atau parameter tambahan tidak signifikan).", "(model hasil overfitting memiliki AIC lebih kecil dan parameter tambahan signifikan).")`
+
+# Tahap 8: Peramalan
+
+## Model Akhir
+
+```{r final-summary}
+summary(final_model)
+```
+
+## Peramalan pada Data Uji
+
+```{r forecast}
+fc <- forecast(final_model, h = n_test, level = 95)
+
+plot(seq_len(n), y, type = "l", col = "grey40", xlab = "Waktu", ylab = "Nilai",
+     main = paste("Peramalan", final_nama), xlim = c(n_train - 60, n),
+     ylim = range(c(y[(n_train - 60):n], fc$lower, fc$upper)))
+polygon(c(n_train + seq_len(n_test), rev(n_train + seq_len(n_test))),
+        c(fc$lower, rev(fc$upper)), col = rgb(0, 0, 1, 0.15), border = NA)
+lines(n_train + seq_len(n_test), as.numeric(fc$mean), col = "blue", lwd = 2)
+lines(n_train + seq_len(n_test), test, col = "red", lwd = 2)
+abline(v = n_train, lty = 2)
+legend("topleft", c("Data aktual", "Data uji", "Ramalan", "Selang kepercayaan 95%"),
+       col = c("grey40", "red", "blue", rgb(0, 0, 1, 0.3)), lwd = c(1, 2, 2, 8), bty = "n")
+```
+
+## Akurasi Peramalan
+
+```{r accuracy}
+acc <- accuracy(fc, test)
+acc
+hasil.ramal <- data.frame(Tanggal = tgl.test, Aktual = test,
+                          Ramalan = round(as.numeric(fc$mean), 1),
+                          Bawah95 = round(as.numeric(fc$lower), 1),
+                          Atas95 = round(as.numeric(fc$upper), 1))
+hasil.ramal
+```
+
+Pada data uji, model **`r final_nama`** menghasilkan MAPE sebesar **`r round(acc["Test set", "MAPE"], 2)`%**
+dan RMSE **`r round(acc["Test set", "RMSE"], 2)`**. Nilai MAPE
+`r ifelse(acc["Test set", "MAPE"] < 10, "di bawah 10% sehingga kemampuan peramalan tergolong sangat baik.", ifelse(acc["Test set", "MAPE"] < 20, "berada di antara 10% dan 20% sehingga kemampuan peramalan tergolong baik.", "di atas 20% sehingga kemampuan peramalan perlu ditingkatkan."))`
+
+## Peramalan ke Depan (12 Bulan)
+
+Model dengan orde yang sama diduga ulang menggunakan seluruh data, kemudian digunakan untuk meramal 12 bulan setelah
+amatan terakhir.
+
+```{r forecast-future}
+full.ts <- ts(y)
+fit.full <- Arima(full.ts, order = c(final_pq[1], d_use, final_pq[2]),
+                  include.drift = (d_use == 1), lambda = lam, method = "ML")
+fc.future <- forecast(fit.full, h = 12, level = 95)
+plot(fc.future, include = 60, main = paste("Peramalan 12 Periode ke Depan:", final_nama),
+     xlab = "Waktu", ylab = "Nilai")
+data.frame(Periode = seq_len(12), Ramalan = round(as.numeric(fc.future$mean), 1),
+           Bawah95 = round(as.numeric(fc.future$lower), 1), Atas95 = round(as.numeric(fc.future$upper), 1))
+```
+
+# Kesimpulan
+
+Data CES9093161101 dengan `r n` amatan dibagi menjadi `r n_train` data latih dan `r n_test` data uji. Data latih
+`r ifelse(adf.train$p.value < 0.05, "stasioner dalam rataan", paste0("tidak stasioner dalam rataan sehingga dilakukan differencing sebanyak ", d_use, " kali"))`
+dan `r ifelse(ragam_stasioner, "stasioner dalam ragam.", "tidak stasioner dalam ragam sehingga ditransformasi Box-Cox.")`
+Model terbaik berdasarkan AIC, signifikansi parameter, dan overfitting adalah **`r final_nama`** dengan MAPE data uji
+sebesar `r round(acc["Test set", "MAPE"], 2)`%.
